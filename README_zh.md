@@ -155,7 +155,7 @@ rtk jest                        # Jest 紧凑输出
 rtk vitest                      # Vitest 紧凑输出
 rtk pytest                      # Python 测试（-90%）
 rtk go test                     # Go 测试（-90%）
-rtk test <cmd>                  # 仅显示失败（-90%）
+rtk test <cmd> [args...]        # 仅显示失败（-90%），直接执行 argv
 ```
 
 ### 构建 & 检查
@@ -182,7 +182,7 @@ rtk discover                    # 发现遗漏的节省机会
 
 ## 文档
 
-- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - 解决常见问题
+- **[TROUBLESHOOTING.md](docs/guide/resources/troubleshooting.md)** - 解决常见问题
 - **[INSTALL.md](INSTALL.md)** - 详细安装指南
 - **[ARCHITECTURE.md](docs/contributing/ARCHITECTURE.md)** - 技术架构
 

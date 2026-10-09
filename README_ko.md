@@ -155,7 +155,7 @@ rtk jest                        # Jest 컴팩트
 rtk vitest                      # Vitest 컴팩트
 rtk pytest                      # Python 테스트 (-90%)
 rtk go test                     # Go 테스트 (-90%)
-rtk test <cmd>                  # 실패만 표시 (-90%)
+rtk test <cmd> [args...]        # 실패만 표시 (-90%), argv 직접 실행
 ```
 
 ### 빌드 & 린트
@@ -175,7 +175,7 @@ rtk discover                    # 놓친 절약 기회 발견
 
 ## 문서
 
-- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - 일반적인 문제 해결
+- **[TROUBLESHOOTING.md](docs/guide/resources/troubleshooting.md)** - 일반적인 문제 해결
 - **[INSTALL.md](INSTALL.md)** - 상세 설치 가이드
 - **[ARCHITECTURE.md](docs/contributing/ARCHITECTURE.md)** - 기술 아키텍처
 

@@ -143,6 +143,8 @@ enum Commands {
 
     /// Git commands with compact output
     Git {
+        // Backticks would leak into clap's --help text, so silence rustdoc here instead.
+        #[allow(rustdoc::invalid_html_tags)]
         /// Change to directory before executing (like git -C <path>, can be repeated)
         #[arg(short = 'C', action = clap::ArgAction::Append)]
         directory: Vec<String>,
@@ -240,13 +242,19 @@ enum Commands {
 
     /// Run command and show only errors/warnings
     Err {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Command to run
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
 
     /// Run tests and show only failures
     Test {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Test command (e.g. cargo test)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -286,10 +294,15 @@ enum Commands {
     },
 
     /// Ultra-condensed diff (only changed lines)
+    ///
+    /// Comparing two files exits 0 if identical, 1 if different, and 2 on a
+    /// file-read error. A single file operand is a usage error (exit 2), not a
+    /// diff to condense; `-` reads a piped diff from stdin. Non-UTF-8 files are
+    /// compared byte for byte.
     Diff {
         /// First file or - for stdin (unified diff)
         file1: PathBuf,
-        /// Second file (optional if stdin)
+        /// Second file (omit only when the first is - for stdin)
         file2: Option<PathBuf>,
     },
 
@@ -325,8 +338,11 @@ enum Commands {
 
     /// Run command and show heuristic summary
     Summary {
+        /// Execute one quoted command string with this shell instead of direct argv execution
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
         /// Command to run and summarize
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
 
@@ -644,7 +660,7 @@ enum Commands {
 
     /// Discover missed RTK savings from Claude Code history
     Discover {
-        /// Filter by project path (substring match)
+        /// Filter by project path (substring match; case-insensitive on Windows)
         #[arg(short, long)]
         project: Option<String>,
         /// Max commands per section
@@ -672,7 +688,7 @@ enum Commands {
 
     /// Learn CLI corrections from Claude Code error history
     Learn {
-        /// Filter by project path (substring match)
+        /// Filter by project path (substring match; case-insensitive on Windows)
         #[arg(short, long)]
         project: Option<String>,
         /// Scan all projects (default: current project only)
@@ -695,12 +711,20 @@ enum Commands {
         min_occurrences: usize,
     },
 
-    /// Execute a shell command via sh -c (raw, no filtering or tracking)
+    /// Execute argv directly, or a command string through an explicit shell
     Run {
-        /// Command string to execute (use -c for shell-like invocation)
-        #[arg(short = 'c', long = "command")]
+        /// Command string to execute through a shell
+        #[arg(short = 'c', long = "command", conflicts_with = "args")]
         command: Option<String>,
-        /// Positional command arguments (alternative to -c)
+        /// Shell used with -c (defaults to sh on Unix and cmd on Windows)
+        #[arg(
+            long,
+            value_name = "SHELL",
+            requires = "command",
+            conflicts_with = "args"
+        )]
+        shell: Option<String>,
+        /// Program and literal arguments for direct execution (alternative to -c)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -987,8 +1011,20 @@ enum HookCommands {
     Copilot,
     /// Process Factory Droid PreToolUse hook (reads JSON from stdin)
     Droid,
+    /// Process Google Antigravity PreToolUse hook (reads JSON from stdin)
+    Antigravity,
     /// Process Mistral Vibe CLI pre_tool hook (reads JSON from stdin)
     Vibe,
+    /// Answer for OpenCode's plugin: the rewrite as JSON, or `{}` when
+    /// rewriting would change what OpenCode's own permission rules decide
+    Opencode {
+        /// Active OpenCode agent, when its rules scope permissions by one
+        #[arg(long)]
+        agent: Option<String>,
+        /// Raw command to judge and rewrite
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -1558,7 +1594,24 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
         parse_error.exit();
     }
 
+    // `rtk test` deliberately shadows the POSIX `test` binary, so it cannot join
+    // that list — but a misused `--shell` is RTK's own flag, not something to
+    // hand to `test`. Without this, `rtk test --shell` execs the real `test`
+    // with no arguments and exits 0, silently ignoring the request (#4125).
+    //
+    // Scoped to `test` alone: `--shell` is a flag other tools carry too, and an
+    // argv-wide scan would refuse to run `just --shell bash` or
+    // `hyperfine --shell=none` — including the spellings the hook itself emits.
+    if args[0] == "test"
+        && args
+            .iter()
+            .any(|arg| arg == "--shell" || arg.starts_with("--shell="))
+    {
+        parse_error.exit();
+    }
+
     let raw_command = args.join(" ");
+    let tracked_command = core::shell::display_command(&args);
     let error_message = core::utils::strip_ansi(&parse_error.to_string());
 
     // Start timer before execution to capture actual command runtime
@@ -1644,18 +1697,22 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
                 };
 
                 timer.track(
-                    &raw_command,
-                    &format!("rtk:toml {}", raw_command),
+                    &tracked_command,
+                    &format!("rtk:toml {}", tracked_command),
                     &combined_raw,
                     &shown,
                 );
-                core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
+                core::tracking::record_parse_failure_silent(&tracked_command, &error_message, true);
 
                 Ok(exit_code)
             }
             Err(e) => {
                 // Command not found — same behaviour as no-TOML path
-                core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
+                core::tracking::record_parse_failure_silent(
+                    &tracked_command,
+                    &error_message,
+                    false,
+                );
                 eprintln!("[rtk: {}]", e);
                 Ok(127)
             }
@@ -1671,14 +1728,21 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
 
         match status {
             Ok(s) => {
-                timer.track_passthrough(&raw_command, &format!("rtk fallback: {}", raw_command));
+                timer.track_passthrough(
+                    &tracked_command,
+                    &format!("rtk fallback: {}", tracked_command),
+                );
 
-                core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
+                core::tracking::record_parse_failure_silent(&tracked_command, &error_message, true);
 
                 Ok(core::utils::exit_code_from_status(&s, &raw_command))
             }
             Err(e) => {
-                core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
+                core::tracking::record_parse_failure_silent(
+                    &tracked_command,
+                    &error_message,
+                    false,
+                );
                 // Command not found or other OS error — single message, no duplicate Clap error
                 eprintln!("[rtk: {}]", e);
                 Ok(127)
@@ -1728,6 +1792,15 @@ enum GtCommands {
 /// e.g. `git log --format="%H %s"` → ["git", "log", "--format=%H %s"]
 fn shell_split(input: &str) -> Vec<String> {
     discover::lexer::shell_split(input)
+}
+
+/// The tracked command for `rtk proxy`: the program word is quoted like its
+/// arguments, so the row matches what the fallback records for the same argv.
+fn proxy_label(cmd_name: &str, cmd_args: &[String]) -> String {
+    let words: Vec<&str> = std::iter::once(cmd_name)
+        .chain(cmd_args.iter().map(String::as_str))
+        .collect();
+    core::shell::display_command(&words)
 }
 
 fn build_k8s_namespace_args(namespace: Option<String>, all: bool) -> Vec<String> {
@@ -1906,6 +1979,8 @@ where
         uninstall_hermes(ctx)
     } else if agent == Some(AgentTarget::Trae) {
         hooks::init::uninstall_trae_mode(global, ctx)
+    } else if agent == Some(AgentTarget::Antigravity) {
+        hooks::init::uninstall_antigravity_mode(global, ctx)
     } else if agent == Some(AgentTarget::Droid) {
         hooks::init::uninstall_droid(global, ctx)
     } else if agent == Some(AgentTarget::Vibe) {
@@ -1926,6 +2001,94 @@ fn is_native_test_expression(command: &[String]) -> bool {
         Some(arg) => arg.starts_with('-'),
         None => false,
     }
+}
+
+/// Strip the shell grouping a command carries, returning how many negations were
+/// removed along with the command itself.
+///
+/// `!` and `( … )` are both `test`'s syntax and the shell's, and
+/// [`is_native_test_expression`] already treats them as possible native
+/// prefixes. A command behind them is not a native expression, so it runs
+/// through the test filter — and the negation and grouping the joined `sh -c`
+/// string used to get from the shell have to come from somewhere.
+///
+/// They nest, so they are stripped in one loop until neither applies: a single
+/// pass of each leaves `! ( cmd )` with `(` as its program, which is not found
+/// — and the negation would then turn that 127 into a reported *pass* for a
+/// command that never ran.
+fn split_leading_negations(command: Vec<String>) -> (usize, Vec<String>) {
+    let mut command = command;
+    let mut negations = 0;
+
+    loop {
+        let bangs = command.iter().take_while(|token| *token == "!").count();
+        // All `!` and nothing to negate: leave it alone so the runner reports it.
+        if bangs > 0 && bangs < command.len() {
+            negations += bangs;
+            command = command[bangs..].to_vec();
+            continue;
+        }
+        if let Some(grouped) = strip_outer_group(&command) {
+            command = grouped;
+            continue;
+        }
+        return (negations, command);
+    }
+}
+
+/// Peel one `( … )` that wraps the whole command.
+///
+/// The parentheses must balance across the command, so `( a ) b ( c )` — where
+/// the first `(` closes before the end — keeps both of them.
+fn strip_outer_group(command: &[String]) -> Option<Vec<String>> {
+    if command.len() <= 2 || command.first()? != "(" || command.last()? != ")" {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (index, token) in command.iter().enumerate() {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+        if depth == 0 && index + 1 < command.len() {
+            return None;
+        }
+    }
+
+    (depth == 0).then(|| command[1..command.len() - 1].to_vec())
+}
+
+/// `--shell` runs one complete script, so it takes exactly one positional.
+///
+/// Clap cannot express "exactly one value for this positional when that flag is
+/// present", and `run` spells the same rule as `conflicts_with`/`requires`
+/// around its own `-c`. Enforcing it here keeps the other three surfaces
+/// answering with a usage error instead of failing mid-execution — reported by
+/// the subcommand that was asked, so the usage line names it.
+fn require_single_script(subcommand: &str, shell: Option<&str>, command: &[String]) {
+    use clap::CommandFactory;
+
+    if shell.is_none() || command.len() == 1 {
+        return;
+    }
+
+    let mut cli = Cli::command();
+    let mut surface = cli
+        .find_subcommand_mut(subcommand)
+        .expect("every caller names its own subcommand")
+        .clone()
+        // Taken on its own, the subcommand's usage line reads `test …` — the
+        // name of the POSIX utility `rtk test` shadows. Spell the binary the
+        // caller actually typed.
+        .bin_name(format!("rtk {subcommand}"));
+    surface
+        .error(
+            ErrorKind::WrongNumberOfValues,
+            core::shell::SHELL_ARITY_MESSAGE,
+        )
+        .exit();
 }
 
 fn run_cli() -> Result<i32> {
@@ -2165,20 +2328,15 @@ fn run_cli() -> Result<i32> {
             repo,
             group,
             subcommand,
-            mut args,
-        } => {
-            // Append -R / -g flags at end so they don't interfere with
-            // subcommand dispatch (args[0] must be the sub-subcommand like "list")
-            if let Some(r) = repo {
-                args.push("-R".to_string());
-                args.push(r);
-            }
-            if let Some(g) = group {
-                args.push("-g".to_string());
-                args.push(g);
-            }
-            glab_cmd::run(&subcommand, &args, cli.verbose, cli.ultra_compact)?
-        }
+            args,
+        } => glab_cmd::run(
+            &subcommand,
+            &args,
+            repo.as_deref(),
+            group.as_deref(),
+            cli.verbose,
+            cli.ultra_compact,
+        )?,
 
         Commands::Aws { subcommand, args } => aws_cmd::run(&subcommand, &args, cli.verbose)?,
 
@@ -2222,18 +2380,33 @@ fn run_cli() -> Result<i32> {
             }
         }
 
-        Commands::Err { command } => {
-            let cmd = command.join(" ");
-            runner::run_err(&cmd, cli.verbose)?
+        Commands::Err { shell, command } => {
+            require_single_script("err", shell.as_deref(), &command);
+            runner::run_err(&command, shell.as_deref(), cli.verbose)
+                .context("Failed to run err command")?
         }
 
-        Commands::Test { command } => {
-            if is_native_test_expression(&command) {
+        Commands::Test { shell, command } => {
+            require_single_script("test", shell.as_deref(), &command);
+            // A native `test` expression (`rtk test -f Cargo.toml`) still goes
+            // to the real `test` binary; `--shell` means the caller asked for a
+            // script, so it never takes that path.
+            if shell.is_none() && is_native_test_expression(&command) {
                 let args: Vec<OsString> = command.into_iter().map(OsString::from).collect();
                 core::runner::run_passthrough("test", &args, cli.verbose)?
             } else {
-                let cmd = command.join(" ");
-                runner::run_test(&cmd, cli.verbose)?
+                // `rtk test ! <cmd>` negates the command's exit status. The
+                // joined `sh -c` string used to get that from the shell; direct
+                // execution applies it here instead, so the boundaries survive
+                // and no shell is interposed for it.
+                let (negations, command) = split_leading_negations(command);
+                let code = runner::run_test(&command, shell.as_deref(), cli.verbose)
+                    .context("Failed to run test command")?;
+                if negations % 2 == 1 {
+                    i32::from(code == 0)
+                } else {
+                    code
+                }
             }
         }
 
@@ -2265,9 +2438,14 @@ fn run_cli() -> Result<i32> {
         Commands::Diff { file1, file2 } => {
             if let Some(f2) = file2 {
                 diff_cmd::run(&file1, &f2, cli.verbose)?
-            } else {
+            } else if file1.as_os_str() == "-" {
                 diff_cmd::run_stdin(cli.verbose)?;
                 0
+            } else {
+                // `diff` rejects a lone file operand as a usage error, exit 2,
+                // before opening it, so `diff <file> && next` stops here too.
+                eprintln!("diff: missing operand after '{}'", file1.display());
+                2
             }
         }
 
@@ -2352,9 +2530,10 @@ fn run_cli() -> Result<i32> {
             OcCommands::Other(args) => container::run_oc_passthrough(&args, cli.verbose)?,
         },
 
-        Commands::Summary { command } => {
-            let cmd = command.join(" ");
-            summary::run(&cmd, cli.verbose)?
+        Commands::Summary { shell, command } => {
+            require_single_script("summary", shell.as_deref(), &command);
+            summary::run(&command, shell.as_deref(), cli.verbose)
+                .context("Failed to run summary command")?
         }
 
         Commands::Grep {
@@ -2447,12 +2626,7 @@ fn run_cli() -> Result<i32> {
                 }
                 hooks::init::run_kilocode_mode(ctx)?;
             } else if agent == Some(AgentTarget::Antigravity) {
-                if global {
-                    anyhow::bail!(
-                        "Antigravity is project-scoped. Use: rtk init --agent antigravity"
-                    );
-                }
-                hooks::init::run_antigravity_mode(ctx)?;
+                hooks::init::run_antigravity_mode(global, ctx)?;
             } else if agent == Some(AgentTarget::Kimi) {
                 if global {
                     anyhow::bail!("Kimi AI is project-scoped. Use: rtk init --agent kimi");
@@ -2466,10 +2640,14 @@ fn run_cli() -> Result<i32> {
                 hooks::init::run_vibe_mode(global, hook_only, patch_mode, ctx)?;
             } else {
                 let install_opencode = opencode;
-                let install_claude = !opencode;
                 let install_cursor = agent == Some(AgentTarget::Cursor);
                 let install_windsurf = agent == Some(AgentTarget::Windsurf);
                 let install_cline = agent == Some(AgentTarget::Cline);
+                // Sibling agents (Cursor, Windsurf, Cline) fall through to this
+                // shared init path; only the default (no --agent) or an explicit
+                // Claude target should install Claude Code files. Without this
+                // guard, `rtk init -g --agent cursor` writes into ~/.claude (#2097).
+                let install_claude = !install_cursor && !install_windsurf && !install_cline;
 
                 hooks::init::run(
                     global,
@@ -2590,9 +2768,8 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Jest { ref args } | Commands::Vitest { ref args } => {
-            vitest_cmd::run_test(&cli.command, args, cli.verbose)?
-        }
+        Commands::Vitest { ref args } => vitest_cmd::run_vitest(args, cli.verbose)?,
+        Commands::Jest { ref args } => vitest_cmd::run_jest(args, cli.verbose)?,
 
         Commands::Ctest { args } => ctest_cmd::run(&args, cli.verbose)?,
 
@@ -2792,10 +2969,13 @@ fn run_cli() -> Result<i32> {
                                     cmd.arg(arg);
                                 }
                                 let status = cmd.status().context("Failed to run npx prisma")?;
-                                let args_str = args.join(" ");
+                                let tracked = core::shell::with_args(
+                                    "npx",
+                                    &core::shell::display_args(&args),
+                                );
                                 timer.track_passthrough(
-                                    &format!("npx {}", args_str),
-                                    &format!("rtk npx {} (passthrough)", args_str),
+                                    &tracked,
+                                    &core::tracking::passthrough_label(&tracked),
                                 );
                                 core::utils::exit_code_from_status(&status, "npx prisma")
                             }
@@ -2806,7 +2986,10 @@ fn run_cli() -> Result<i32> {
                             .arg("prisma")
                             .status()
                             .context("Failed to run npx prisma")?;
-                        timer.track_passthrough("npx prisma", "rtk npx prisma (passthrough)");
+                        timer.track_passthrough(
+                            "npx prisma",
+                            &core::tracking::passthrough_label("npx prisma"),
+                        );
                         core::utils::exit_code_from_status(&status, "npx prisma")
                     }
                 }
@@ -2917,8 +3100,16 @@ fn run_cli() -> Result<i32> {
                 hooks::hook_cmd::run_droid()?;
                 0
             }
+            HookCommands::Antigravity => {
+                hooks::hook_cmd::run_antigravity()?;
+                0
+            }
             HookCommands::Vibe => {
                 hooks::hook_cmd::run_vibe()?;
+                0
+            }
+            HookCommands::Opencode { agent, args } => {
+                hooks::hook_cmd::run_opencode(&args.join(" "), agent.as_deref())?;
                 0
             }
             HookCommands::Check { agent, command } => {
@@ -2968,24 +3159,55 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Run { command, args } => {
-            let raw = match command {
-                Some(c) => c,
-                None if !args.is_empty() => args.join(" "),
-                None => String::new(),
-            };
-            if raw.trim().is_empty() {
+        Commands::Run {
+            command,
+            shell,
+            args,
+        } => {
+            if command
+                .as_deref()
+                .is_none_or(|script| script.trim().is_empty())
+                && args.is_empty()
+            {
                 0
             } else {
-                use std::process::Command as ProcCommand;
-                let shell = if cfg!(windows) { "cmd" } else { "sh" };
-                let flag = if cfg!(windows) { "/C" } else { "-c" };
-                let status = ProcCommand::new(shell)
-                    .arg(flag)
-                    .arg(&raw)
-                    .status()
-                    .with_context(|| format!("Failed to execute: {}", raw))?;
-                core::utils::exit_code_from_status(&status, "run")
+                let (launch, description, program) = match command {
+                    Some(script) => (
+                        core::shell::shell_command(&script, shell.as_deref())
+                            .context("Failed to prepare run shell command")?,
+                        format!("shell command: {script}"),
+                        core::shell::program_name(&[], shell.as_deref()).to_string(),
+                    ),
+                    None => (
+                        core::shell::direct_command(&args)
+                            .context("Failed to prepare direct run command")?,
+                        core::shell::display_command(&args),
+                        core::shell::program_name(&args, None).to_string(),
+                    ),
+                };
+                match launch {
+                    core::shell::Launch::Ready(mut prepared) => match prepared.status() {
+                        Ok(status) => core::utils::exit_code_from_status(&status, "run"),
+                        Err(error) => {
+                            let error = anyhow::Error::new(error)
+                                .context(format!("Failed to execute {description}"));
+                            match core::shell::spawn_failure(&program, &error) {
+                                Some(outcome) => {
+                                    eprint!("{}", outcome.message);
+                                    outcome.code
+                                }
+                                None => return Err(error),
+                            }
+                        }
+                    },
+                    // `rtk run` is a raw passthrough, so it reports a program it
+                    // cannot run the way a shell does: the message on stderr and
+                    // the shell's own exit code.
+                    core::shell::Launch::Unrunnable(outcome) => {
+                        eprint!("{}", outcome.message);
+                        outcome.code
+                    }
+                }
             }
         }
 
@@ -3182,9 +3404,10 @@ fn run_cli() -> Result<i32> {
             let full_output = format!("{}{}", stdout, stderr);
 
             // Track usage (input = output since no filtering)
+            let label = proxy_label(&cmd_name, &cmd_args);
             timer.track(
-                &format!("{} {}", cmd_name, cmd_args.join(" ")),
-                &format!("rtk proxy {} {}", cmd_name, cmd_args.join(" ")),
+                &label,
+                &format!("rtk proxy {label}"),
                 &full_output,
                 &full_output,
             );
@@ -3259,6 +3482,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Rg { .. }
             | Commands::AstGrep { .. }
             | Commands::Wget { .. }
+            | Commands::Jest { .. }
             | Commands::Vitest { .. }
             | Commands::Ctest { .. }
             | Commands::Prisma { .. }
@@ -3300,8 +3524,31 @@ fn is_operational_command(cmd: &Commands) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::test_isolation;
     use clap::Parser;
     use std::cell::Cell;
+
+    #[test]
+    fn test_jest_and_vitest_get_the_hook_integrity_check() {
+        for framework in ["jest", "vitest"] {
+            let cli = Cli::try_parse_from(["rtk", framework, "src/a.test.js"])
+                .expect("rtk <framework> <path> parses");
+            assert!(is_operational_command(&cli.command), "{framework}");
+        }
+    }
+
+    #[test]
+    fn proxy_label_quotes_the_program_like_the_fallback() {
+        let argv = vec!["/p/My Tools/run".to_string(), "x".to_string()];
+        assert_eq!(proxy_label(&argv[0], &argv[1..]), "'/p/My Tools/run' x");
+        // run_fallback records display_command over the whole argv.
+        assert_eq!(
+            proxy_label(&argv[0], &argv[1..]),
+            core::shell::display_command(&argv)
+        );
+        assert_eq!(proxy_label("echo", &[]), "echo");
+        assert_eq!(proxy_label("FOO=1", &["x".to_string()]), "'FOO=1' x");
+    }
 
     #[test]
     fn test_git_commit_single_message() {
@@ -3761,7 +4008,10 @@ mod tests {
         // RTK meta-commands should produce parse errors (not fall through to raw execution).
         // Skip "proxy" because it uses trailing_var_arg (accepts any args by design).
         for cmd in core::constants::RTK_META_COMMANDS {
-            if matches!(*cmd, "proxy" | "run" | "rewrite" | "session") {
+            if matches!(
+                *cmd,
+                "proxy" | "run" | "rewrite" | "session" | "err" | "summary"
+            ) {
                 continue; // these use trailing_var_arg (accept any args by design)
             }
             let result = Cli::try_parse_from(["rtk", cmd, "--nonexistent-flag-xyz"]);
@@ -3792,7 +4042,6 @@ mod tests {
             "aws",
             "psql",
             "pnpm",
-            "err",
             "test",
             "env",
             "find",
@@ -3802,7 +4051,6 @@ mod tests {
             "docker",
             "kubectl",
             "oc",
-            "summary",
             "grep",
             "wget",
             "wc",
@@ -3870,8 +4118,13 @@ mod tests {
     fn test_run_command_with_dash_c() {
         let cli = Cli::try_parse_from(["rtk", "run", "-c", "git status && echo done"]).unwrap();
         match cli.command {
-            Commands::Run { command, args } => {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
                 assert_eq!(command, Some("git status && echo done".to_string()));
+                assert!(shell.is_none());
                 assert!(args.is_empty());
             }
             _ => panic!("Expected Run command"),
@@ -3882,8 +4135,13 @@ mod tests {
     fn test_run_command_positional_args() {
         let cli = Cli::try_parse_from(["rtk", "run", "echo", "hello"]).unwrap();
         match cli.command {
-            Commands::Run { command, args } => {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
                 assert!(command.is_none());
+                assert!(shell.is_none());
                 assert_eq!(args, vec!["echo", "hello"]);
             }
             _ => panic!("Expected Run command"),
@@ -3899,6 +4157,29 @@ mod tests {
                 _ => panic!("Expected Ctest command"),
             }
         }
+    }
+
+    #[test]
+    fn test_run_command_with_explicit_shell() {
+        let cli =
+            Cli::try_parse_from(["rtk", "run", "--shell", "fish", "-c", "echo (pwd)"]).unwrap();
+        match cli.command {
+            Commands::Run {
+                command,
+                shell,
+                args,
+            } => {
+                assert_eq!(command, Some("echo (pwd)".to_string()));
+                assert_eq!(shell, Some("fish".to_string()));
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_shell_requires_command_string() {
+        assert!(Cli::try_parse_from(["rtk", "run", "--shell", "fish", "echo"]).is_err());
     }
 
     #[test]
@@ -4294,18 +4575,13 @@ mod tests {
     #[test]
     #[ignore] // Integration test: requires `cargo build` first
     fn test_broken_pipe_does_not_crash() {
-        let bin_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("debug")
-            .join("rtk");
-        assert!(
-            bin_path.exists(),
-            "Debug binary not found at {:?} - run `cargo build` first",
-            bin_path
-        );
+        // A throwaway repo, not whichever one the contributor happens to be sitting in:
+        // outside a repo `git log` only errors, and the test stops exercising the pipe.
+        let repo = test_isolation::temp_git_repo();
 
-        let mut child = std::process::Command::new(&bin_path)
+        let mut child = test_isolation::rtk_command()
             .args(["git", "log", "--oneline", "-50"])
+            .current_dir(repo.path())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

@@ -156,7 +156,7 @@ rtk vitest                      # Vitest compacto
 rtk pytest                      # Tests Python (-90%)
 rtk go test                     # Tests Go (-90%)
 rtk cargo test                  # Tests Rust (-90%)
-rtk test <cmd>                  # Solo fallos (-90%)
+rtk test <cmd> [args...]        # Solo fallos (-90%), argv directo
 ```
 
 ### Build & Lint
@@ -176,7 +176,7 @@ rtk discover                    # Descubrir ahorros perdidos
 
 ## Documentacion
 
-- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Resolver problemas comunes
+- **[TROUBLESHOOTING.md](docs/guide/resources/troubleshooting.md)** - Resolver problemas comunes
 - **[INSTALL.md](INSTALL.md)** - Guia de instalacion detallada
 - **[ARCHITECTURE.md](docs/contributing/ARCHITECTURE.md)** - Arquitectura tecnica
 
