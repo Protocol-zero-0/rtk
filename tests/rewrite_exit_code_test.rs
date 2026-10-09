@@ -6,6 +6,8 @@
 //! rewritten command must exit with exactly the code the raw command would
 //! have — compressing the output may never change the status.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,59 +18,45 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = common::temp_git_repo();
         let root = dir.path().to_path_buf();
-        for sub in ["repo", "home", "tee"] {
-            std::fs::create_dir_all(root.join(sub)).expect("mkdir");
-        }
-        let repo = root.join("repo");
-        std::fs::write(repo.join("a.txt"), "alpha\nbeta\n").expect("write");
+        std::fs::write(root.join("a.txt"), "alpha\nbeta\n").expect("write");
         for args in [
-            &["init", "-q", "."][..],
             &["add", "a.txt"][..],
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ][..],
+            &["commit", "-q", "-m", "add fixture"][..],
         ] {
-            let ok = Command::new("git")
+            let mut git = Command::new("git");
+            common::isolate_git(&mut git);
+            let ok = git
                 .args(args)
-                .current_dir(&repo)
-                .env("HOME", root.join("home"))
+                .current_dir(&root)
                 .status()
                 .expect("git")
                 .success();
             assert!(ok, "git {args:?} failed");
         }
+        // A tracked change makes `git diff --exit-code` exercise a real failure.
+        std::fs::write(root.join("a.txt"), "alpha\nbeta\ngamma\n").expect("modify");
         Sandbox { _dir: dir, root }
     }
 
     fn repo(&self) -> PathBuf {
-        self.root.join("repo")
+        self.root.clone()
     }
 
     /// Isolate rtk's config, tracking DB and tee output from the developer's machine,
     /// and put the freshly built `rtk` first on PATH so rewritten commands resolve it.
     fn command(&self, program: &str) -> Command {
-        let bin_dir = Path::new(env!("CARGO_BIN_EXE_rtk")).parent().unwrap();
-        let path = format!(
-            "{}:{}",
-            bin_dir.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let rtk = common::rtk_command();
+        let bin_dir = Path::new(rtk.get_program()).parent().unwrap().to_path_buf();
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let path =
+            std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(&inherited)))
+                .expect("PATH entries join");
         let mut cmd = Command::new(program);
+        common::isolate_rtk(&mut cmd);
         cmd.current_dir(self.repo())
             .env("PATH", path)
-            .env("HOME", self.root.join("home"))
-            .env("XDG_CONFIG_HOME", self.root.join("home/.config"))
-            .env("RTK_DB_PATH", self.root.join("rtk.db"))
-            .env("RTK_TEE_DIR", self.root.join("tee"))
             .env("LC_ALL", "C");
         cmd
     }
@@ -85,8 +73,10 @@ impl Sandbox {
     /// `rtk rewrite` prints the rewrite and exits 0 (allow) or 3 (ask); anything
     /// else means the hook would run the command unchanged.
     fn rewrite(&self, script: &str) -> Option<String> {
-        let out = self
-            .command(env!("CARGO_BIN_EXE_rtk"))
+        let mut cmd = common::rtk_command();
+        let out = cmd
+            .current_dir(self.repo())
+            .env("LC_ALL", "C")
             .args(["rewrite", script])
             .output()
             .expect("rtk rewrite");
@@ -109,32 +99,45 @@ fn python3_available() -> bool {
 /// Each case pairs a recognized tool (the part rtk rewrites) with a failing or
 /// succeeding step, so both the tool's own status and a status flowing through
 /// an `&&` chain are covered.
-const CASES: &[&str] = &[
-    "git status",
-    "git log -1 && sh -c 'exit 9'",
-    "git diff --exit-code HEAD && sh -c 'exit 7'",
-    "ls /nonexistent-rtk-path",
-    "ls a.txt && sh -c 'exit 13'",
-    "grep -r not-present-anywhere .",
-    "grep -r alpha . && sh -c 'exit 14'",
-    "wc -l /nonexistent-rtk-path",
-    "cat /nonexistent-rtk-path",
-    "cat a.txt && sh -c 'exit 11'",
-    "head -n 1 a.txt && sh -c 'exit 15'",
-    "find . -name a.txt -exec false {} +",
-    "true; sh -c 'exit 12'",
-    "sh -c 'exit 5'",
+const CASES: &[(&str, i32)] = &[
+    ("git status", 0),
+    ("git log -1 && sh -c 'exit 9'", 9),
+    ("git log --no-such-flag", 128),
+    ("git diff --exit-code", 1),
+    ("git diff --exit-code HEAD && sh -c 'exit 7'", 1),
+    ("git show no-such-rev && sh -c 'exit 9'", 128),
+    ("ls /nonexistent-rtk-path", missing_ls_exit()),
+    (
+        "ls /nonexistent-rtk-path && sh -c 'exit 13'",
+        missing_ls_exit(),
+    ),
+    ("ls /nonexistent-rtk-path || sh -c 'exit 13'", 13),
+    ("ls a.txt || sh -c 'exit 13'", 0),
+    ("ls a.txt && sh -c 'exit 13'", 13),
+    ("grep -r not-present-anywhere a.txt", 1),
+    ("grep -r alpha a.txt && sh -c 'exit 14'", 14),
+    ("wc -l /nonexistent-rtk-path", 1),
+    ("cat /nonexistent-rtk-path", 1),
+    ("cat a.txt && sh -c 'exit 11'", 11),
+    ("head -n 1 a.txt && sh -c 'exit 15'", 15),
+    ("find . -name a.txt -exec false {} +", 1),
+    ("git status; sh -c 'exit 12'", 12),
 ];
 
-const PYTHON_CASES: &[&str] = &[
+// GNU ls returns 2 for a missing operand; BSD ls returns 1.
+const fn missing_ls_exit() -> i32 {
+    if cfg!(target_os = "macos") { 1 } else { 2 }
+}
+
+const PYTHON_CASES: &[(&str, i32)] = &[
     // Bare `python3 -c` one-liners are intentional passthrough commands.
     // These compound cases exercise a rewritten git/ls segment while keeping
     // the Python step's exit status intact.
-    "git status && python3 -c 'import sys; sys.exit(8)'",
-    "ls a.txt && python3 -c 'import sys; sys.exit(6)'",
+    ("git status && python3 -c 'import sys; sys.exit(8)'", 8),
+    ("ls a.txt && python3 -c 'import sys; sys.exit(6)'", 6),
 ];
 
-fn cases() -> Vec<&'static str> {
+fn cases() -> Vec<(&'static str, i32)> {
     let mut all = CASES.to_vec();
     if python3_available() {
         all.extend_from_slice(PYTHON_CASES);
@@ -146,11 +149,12 @@ fn cases() -> Vec<&'static str> {
 fn rewritten_commands_keep_the_raw_exit_code() {
     let sb = Sandbox::new();
     let mut mismatches = Vec::new();
-    for case in cases() {
-        let Some(rewritten) = sb.rewrite(case) else {
-            continue;
-        };
+    for (case, expected) in cases() {
+        let rewritten = sb
+            .rewrite(case)
+            .unwrap_or_else(|| panic!("case must exercise the rewrite path: {case}"));
         let raw = sb.sh_exit(case);
+        assert_eq!(raw, Some(expected), "raw fixture exit changed: {case}");
         let via_rtk = sb.sh_exit(&rewritten);
         if raw != via_rtk {
             mismatches.push(format!(
@@ -166,24 +170,15 @@ fn rewritten_commands_keep_the_raw_exit_code() {
 }
 
 #[test]
-fn most_cases_actually_go_through_a_rewrite() {
+fn every_case_actually_goes_through_a_rewrite() {
     // Guards the test above: if the rewrite rules drift so that these commands
     // stop being rewritten, the exit-code check would silently compare `sh`
     // with itself and keep passing.
     let sb = Sandbox::new();
-    let rewritten: Vec<_> = CASES.iter().filter(|c| sb.rewrite(c).is_some()).collect();
-    assert!(
-        rewritten.len() * 2 >= CASES.len(),
-        "only {} of {} cases are rewritten; update CASES so they exercise the rewrite path: {rewritten:?}",
-        rewritten.len(),
-        CASES.len()
-    );
-    if python3_available() {
-        for case in PYTHON_CASES {
-            assert!(
-                sb.rewrite(case).is_some(),
-                "compound Python case must exercise the rewrite path: {case}"
-            );
-        }
+    for (case, _) in cases() {
+        assert!(
+            sb.rewrite(case).is_some(),
+            "case must exercise the rewrite path: {case}"
+        );
     }
 }
