@@ -127,8 +127,9 @@ const CASES: &[&str] = &[
 ];
 
 const PYTHON_CASES: &[&str] = &[
-    "python3 -c 'import sys; sys.exit(3)'",
-    "python3 -c 'raise SystemExit(4)'",
+    // Bare `python3 -c` one-liners are intentional passthrough commands.
+    // These compound cases exercise a rewritten git/ls segment while keeping
+    // the Python step's exit status intact.
     "git status && python3 -c 'import sys; sys.exit(8)'",
     "ls a.txt && python3 -c 'import sys; sys.exit(6)'",
 ];
@@ -177,4 +178,12 @@ fn most_cases_actually_go_through_a_rewrite() {
         rewritten.len(),
         CASES.len()
     );
+    if python3_available() {
+        for case in PYTHON_CASES {
+            assert!(
+                sb.rewrite(case).is_some(),
+                "compound Python case must exercise the rewrite path: {case}"
+            );
+        }
+    }
 }
