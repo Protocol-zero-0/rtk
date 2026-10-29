@@ -88,3 +88,18 @@ fn other_passthrough_subcommands_keep_the_cap() {
         context(&out)
     );
 }
+
+#[test]
+fn shell_completion_output_is_untruncated_and_byte_exact() {
+    let dir = common::tempdir();
+    let document = "complete -F _ruff ruff\n".repeat(512);
+    fake_ruff(
+        dir.path(),
+        &["generate-shell-completion", "bash"],
+        &document,
+    );
+
+    let out = rtk_ruff(dir.path(), &["generate-shell-completion", "bash"]);
+    assert_eq!(out.status.code(), Some(0), "{}", context(&out));
+    assert_eq!(out.stdout, document.as_bytes(), "{}", context(&out));
+}

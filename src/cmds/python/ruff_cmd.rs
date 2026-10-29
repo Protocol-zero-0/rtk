@@ -78,6 +78,18 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         eprintln!("Running: ruff {}", args.join(" "));
     }
 
+    if ruff_output_is_complete(route, args) {
+        // Complete documentation can exceed the capture limit and may contain
+        // shell syntax whose bytes must be preserved exactly.
+        return runner::run(
+            cmd,
+            "ruff",
+            &display_args(args),
+            runner::RunMode::Passthrough,
+            runner::RunOptions::default(),
+        );
+    }
+
     let owned_args = args.to_vec();
     runner::run_filtered(
         cmd,
@@ -123,12 +135,15 @@ fn filter_ruff_output(args: &[String], stdout: &str) -> String {
     }
 }
 
-/// Help and version requests must keep their full stdout.
+/// Help, version, graph JSON and generated shell completions must keep full stdout.
 fn ruff_output_is_complete(route: RuffRoute, args: &[String]) -> bool {
     match route {
         RuffRoute::TopLevel => true,
         RuffRoute::Subcommand { at } => {
-            matches!(args[at].as_str(), "help" | "version") || is_analyze_graph_invocation(args)
+            matches!(
+                args[at].as_str(),
+                "help" | "version" | "generate-shell-completion"
+            ) || is_analyze_graph_invocation(args)
         }
         RuffRoute::Check { .. } => false,
     }
@@ -532,6 +547,31 @@ fn compact_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_requests_are_complete_documents_only_when_routed() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        for args in [
+            args(&["generate-shell-completion", "bash"]),
+            args(&["--isolated", "generate-shell-completion", "bash"]),
+            args(&["--config", "ruff.toml", "generate-shell-completion", "bash"]),
+        ] {
+            let route = route_ruff_args(&args);
+            assert!(ruff_output_is_complete(route, &args));
+        }
+        for args in [
+            args(&["--config", "generate-shell-completion", "check", "src"]),
+            args(&["check", "--", "generate-shell-completion"]),
+        ] {
+            let route = route_ruff_args(&args);
+            assert!(!ruff_output_is_complete(route, &args));
+        }
+    }
 
     #[test]
     fn known_ruff_subcommands_do_not_route_through_check() {
